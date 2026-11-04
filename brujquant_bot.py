@@ -4,17 +4,15 @@ import time
 import json
 import sqlite3
 import tempfile
+import threading
+import urllib.request
+import urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Tuple
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
-except ImportError:
-    pass
 
 import numpy as np
 import pandas as pd
@@ -24,12 +22,11 @@ try:
 except ImportError:
     ccxt = None
 
-# Configure logging with cross-platform temp directory
 _temp_dir = tempfile.gettempdir()
 _log_file = os.path.join(_temp_dir, "brujquant_binance.log")
-_db_default_path = os.path.join(_temp_dir, "brujquant_binance.sqlite")  # BUG FIX 1: variable name was mangled
+_db_default_path = os.path.join(_temp_dir, "brujquant_binance.sqlite")
 
-logger = logging.getLogger("BrujQuantStandalone")
+logger = logging.getLogger("BrujQuantDayTrader")
 logger.setLevel(logging.INFO)
 _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -38,11 +35,37 @@ _stdout_handler.setFormatter(_formatter)
 logger.addHandler(_stdout_handler)
 
 try:
-    _file_handler = RotatingFileHandler(_log_file, maxBytes=5 * 1024 * 1024, backupCount=3)  # BUG FIX 2: missing variable name
+    _file_handler = RotatingFileHandler(_log_file, maxBytes=5 * 1024 * 1024, backupCount=3)
     _file_handler.setFormatter(_formatter)
     logger.addHandler(_file_handler)
 except OSError:
     pass
+
+LATEST_CYCLE_STATUS = {"status": "INITIALIZING", "timestamp": "None"}
+LAST_DAILY_REPORT_DATE = None
+
+
+def send_telegram_alert(message: str) -> bool:
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not bot_token or not chat_id:
+        return False
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true"
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(url, data=payload, headers={"User-Agent": "BrujQuantBot/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception as err:
+        logger.warning("telegram_send_failed error=%s", err)
+        return False
 
 
 @dataclass(frozen=True)
@@ -725,33 +748,126 @@ class BrujQuantDayTraderAgent:
         return self.evaluate_and_trade(df, balance_usdt=bal, symbol=symbol, timeframe=timeframe)
 
 
-def main():
-    is_live = os.getenv("DRY_RUN", "true").lower() == "false"
-    symbol = os.getenv("TRADING_SYMBOL", "XRP/USDT:USDT")
-    timeframe = os.getenv("TRADING_TIMEFRAME", "15m")
-    check_interval = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
+def check_and_send_daily_report(agent: BrujQuantDayTraderAgent):
+    global LAST_DAILY_REPORT_DATE
+    now = datetime.now(timezone.utc)
+    current_date = now.strftime("%Y-%m-%d")
 
-    logger.info("Starting BrujQuant DayTrader Bot. Mode=%s Symbol=%s Timeframe=%s",
-                "LIVE_BINANCE" if is_live else "DRY_RUN", symbol, timeframe)
+    # Send daily summary report at 23:00 UTC (19:00 Bolivia time)
+    if now.hour == 23 and LAST_DAILY_REPORT_DATE != current_date:
+        bal = agent.broker.fetch_live_balance()
+        cur = agent.guardian.conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*), 
+                   SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN pnl_usdt < 0 THEN 1 ELSE 0 END),
+                   COALESCE(SUM(pnl_usdt), 0.0),
+                   COALESCE(SUM(fee_usdt), 0.0)
+            FROM trades 
+            WHERE status = 'CLOSED' AND DATE(closed_at) = DATE('now')
+        """)
+        row = cur.fetchone() or (0, 0, 0, 0.0, 0.0)
+        tot_trades, wins, losses, net_pnl, fees = row
+        win_rate = (wins / tot_trades * 100) if tot_trades > 0 else 0.0
 
-    agent = BrujQuantDayTraderAgent(dry_run=not is_live)
+        pnl_sign = "+" if net_pnl >= 0 else ""
+        report_msg = (
+            f"📊 <b>REPORTE DIARIO DE OPERACIONES</b>\n"
+            f"📅 <i>Fecha: {current_date} (Cierre UTC)</i>\n\n"
+            f"💰 <b>Balance Actual:</b> <code>${bal:.2f} USDT</code>\n"
+            f"📈 <b>PnL Neto Hoy:</b> <code>{pnl_sign}${net_pnl:.2f} USDT</code>\n"
+            f"🎯 <b>Operaciones Hoy:</b> {tot_trades} (✅ {wins} | ❌ {losses})\n"
+            f"📊 <b>Win Rate Hoy:</b> {win_rate:.1f}%\n"
+            f"⛽ <b>Comisiones Pagadas:</b> -${fees:.4f} USDT\n\n"
+            f"🤖 <b>Estado:</b> 🟢 BrujQuant Bot Activo en Binance"
+        )
+        if send_telegram_alert(report_msg):
+            LAST_DAILY_REPORT_DATE = current_date
+            logger.info("Daily telegram report sent successfully.")
 
-    # Initial probe cycle
-    res = agent.run_live_cycle(symbol=symbol, timeframe=timeframe)
-    logger.info("Probe cycle output: %s", json.dumps(res))
 
-    if os.getenv("SINGLE_RUN", "false").lower() == "true":
+class WebhookHealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        response_payload = {
+            "service": "BrujQuant DayTrader Bot (Binance)",
+            "uptime_utc": datetime.now(timezone.utc).isoformat(),
+            "telegram_alerts": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
+            "latest_cycle": LATEST_CYCLE_STATUS
+        }
+        self.wfile.write(json.dumps(response_payload).encode("utf-8"))
+
+    def log_message(self, format, *args):
         return
 
-    logger.info("Daemon active. Listening every %d seconds on completed candles...", check_interval)
+
+def run_trading_loop(symbol="XRP/USDT:USDT", timeframe="15m", check_interval_sec=60):
+    global LATEST_CYCLE_STATUS
+    is_live = os.getenv("DRY_RUN", "true").lower() == "false"
+    logger.info("Background thread trading loop started. Live=%s Symbol=%s Timeframe=%s", is_live, symbol, timeframe)
+    
+    agent = BrujQuantDayTraderAgent(dry_run=not is_live)
+    
+    start_msg = (
+        f"🤖 <b>BrujQuant Bot Conectado</b>\n"
+        f"Modo: <code>{'EN VIVO (Binance)' if is_live else 'PRUEBA (Dry Run)'}</code>\n"
+        f"Par: <code>{symbol}</code> | TF: <code>{timeframe}</code>\n"
+        f"Recibirás un reporte diario a las 19:00 hora Bolivia y alertas automáticas de cada trade."
+    )
+    send_telegram_alert(start_msg)
+
+    last_trade_key = None
+
     while True:
         try:
-            cycle_res = agent.run_live_cycle(symbol=symbol, timeframe=timeframe)
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            logger.info("Cycle @ %s: %s", now_str, json.dumps(cycle_res))
+            cycle_result = agent.run_live_cycle(symbol=symbol, timeframe=timeframe)
+            LATEST_CYCLE_STATUS = {"timestamp": now_str, "result": cycle_result}
+            
+            if isinstance(cycle_result, dict) and cycle_result.get("status") in ("BRACKET_DISPATCHED", "ORDER_APPROVED_AND_SIMULATED"):
+                trade_key = f"{cycle_result.get('symbol')}_{cycle_result.get('entry_price')}"
+                if trade_key != last_trade_key:
+                    last_trade_key = trade_key
+                    alert_trade = (
+                        f"🚨 <b>NUEVA OPERACIÓN ENTRADA</b>\n"
+                        f"Estrategia: <b>{cycle_result.get('strategy', 'Top-3 Confluencia')}</b>\n"
+                        f"Símbolo: <code>{cycle_result.get('symbol')}</code> ({cycle_result.get('side', '').upper()})\n"
+                        f"Entrada: <code>${cycle_result.get('entry_price')}</code>\n"
+                        f"Stop Loss: <code>${cycle_result.get('stop_loss')}</code>\n"
+                        f"Take Profit: <code>${cycle_result.get('take_profit_2_target')}</code>\n"
+                        f"R:R: 1:{cycle_result.get('rr_ratio')}\n"
+                        f"Modo: <code>{cycle_result.get('mode')}</code>"
+                    )
+                    send_telegram_alert(alert_trade)
+
+            check_and_send_daily_report(agent)
+            logger.info("Cycle @ %s: %s", now_str, json.dumps(cycle_result))
         except Exception as err:
-            logger.error("Daemon exception: %s", err)
-        time.sleep(check_interval)
+            logger.error("Trading loop exception: %s", err)
+            LATEST_CYCLE_STATUS = {"error": str(err)}
+            
+        time.sleep(check_interval_sec)
+
+
+def main():
+    port = int(os.getenv("PORT", 8080))
+    symbol = os.getenv("TRADING_SYMBOL", "XRP/USDT:USDT")
+    timeframe = os.getenv("TRADING_TIMEFRAME", "15m")
+    check_interval = int(os.getenv("CHECK_INTERVAL_SEC", 60))
+
+    trading_thread = threading.Thread(target=run_trading_loop, args=(symbol, timeframe, check_interval), daemon=True)
+    trading_thread.start()
+
+    server_address = ("0.0.0.0", port)
+    httpd = HTTPServer(server_address, WebhookHealthHandler)
+    logger.info("Web Health Server listening on 0.0.0.0:%d", port)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    httpd.server_close()
 
 
 if __name__ == "__main__":
