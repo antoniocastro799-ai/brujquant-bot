@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.sqlite
+*.log
+.system_generated/
+test_*.py
+configurar.py
