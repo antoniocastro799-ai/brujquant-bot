@@ -807,7 +807,12 @@ def run_trading_loop(symbol="XRP/USDT:USDT", timeframe="15m", check_interval_sec
     global LATEST_CYCLE_STATUS
     is_live = os.getenv("DRY_RUN", "true").lower() == "false"
     logger.info("Background thread trading loop started. Live=%s Symbol=%s Timeframe=%s", is_live, symbol, timeframe)
-    
+    try:
+        import urllib.request
+        mi_ip = urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode().strip()
+        logger.info(">>> MI IP EXACTA ES: %s <<<", mi_ip)
+    except Exception as err:
+        logger.warning("No se pudo obtener IP: %s", err)
     agent = BrujQuantDayTraderAgent(dry_run=not is_live)
     
     start_msg = (
